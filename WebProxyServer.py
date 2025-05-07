@@ -1,90 +1,130 @@
-from socket import *
+import os
 import sys
+import socket
+from urllib.parse import urlparse
 
-if len(sys.argv) <= 1:
-    print('Usage : "python ProxyServer.py server_ip"\n[server_ip : It is the IP Address Of Proxy Server')
-    sys.exit(2)
+def main():
+    if len(sys.argv) < 2:
+        print('Usage: python3 ProxyServer.py [listen_ip]')
+        sys.exit(1)
 
-# Create a server socket, bind it to a port and start listening
-tcpSerSock = socket(AF_INET, SOCK_STREAM)
+    listen_ip   = sys.argv[1]
+    listen_port = 8888
+    cache_dir   = './cache'
+    os.makedirs(cache_dir, exist_ok=True)
 
-tcpSerSock.bind(('', 8888))  # Bind to port 8888 (or any port you choose)
-tcpSerSock.listen(5)        # Allow up to 5 pending connections
+    # 1) Create & bind the listening socket
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind((listen_ip, listen_port))
+    server.listen(5)
+    print(f"[*] Proxy listening on {listen_ip}:{listen_port}")
 
-while 1:
-    # Strat receiving data from the client
-    print('Ready to serve...')
-    tcpCliSock, addr = tcpSerSock.accept()
-    print('Received a connection from:', addr)
+    while True:
+        client_sock, client_addr = server.accept()
+        print('[*] Connection from', client_addr)
 
-    message = tcpCliSock.recv(1024).decode()
+        # 2) Read full HTTP request headers
+        request_data = b''
+        while True:
+            chunk = client_sock.recv(4096)
+            if not chunk:
+                break
+            request_data += chunk
+            if b'\r\n\r\n' in request_data:
+                break
 
-    print(message)
-    # Extract the filename from the given message
-    print(message.split()[1])
-    filename = message.split()[1].partition("/")[2]
-    print(filename)
-    fileExist = "false"
-    filetouse = "/" + filename
-    print(filetouse)
+        if not request_data:
+            client_sock.close()
+            continue
 
-    try:
-        # Check wether the file exist in the cache
-        f = open(filetouse[1:], "r")
-        outputdata = f.readlines()
-        fileExist = "true"
-        # ProxyServer finds a cache hit and generates a response message
-        tcpCliSock.send("HTTP/1.0 200 OK\r\n")
-        tcpCliSock.send("Content-Type:text/html\r\n")
+        try:
+            request_text = request_data.decode()
+        except UnicodeDecodeError:
+            client_sock.close()
+            continue
 
-        for i in range(0, len(outputdata)):
-            tcpCliSock.send(outputdata[i].encode())
+        # 3) Parse the request line
+        lines        = request_text.split('\r\n')
+        request_line = lines[0]
+        parts = request_line.split()
+        if len(parts) < 3:
+            client_sock.close()
+            continue
+        method, raw_url, version = parts
 
-        print('Read from cache')
-
-    # Error handling for file not found in cache
-    except IOError:
-
-        if fileExist == "false":
-            # Create a socket on the proxyserver
-                
-            c = socket(AF_INET, SOCK_STREAM)
-
-            hostn = filename.replace("www.","",1)
-            print(hostn)
-
-            try:
-                # Connect to the socket to port 80
-                    
-                c.connect((hostn, 80))
-                    
-                # Create a temporary file on this socket and ask port 80 for the file requested by the client
-                fileobj = c.makefile('r', 0)
-                fileobj.write("GET "+"http://" + filename + "HTTP/1.0\n\n")
-                # Read the response into buffer
-
-                buffer = c.recv(4096)
-
-                # Create a new file in the cache for the requested file.
-                # Also send the response in the buffer to client socket and the corresponding file in the cache
-                tmpFile = open("./" + filename,"wb")
-
-                while len(buffer):
-                    tcpCliSock.send(buffer)
-                    tmpFile.write(buffer)
-                    buffer = c.recv(4096)
-
-            except:
-                print("Illegal request")
-        
+        # 4) Determine target_host & path
+        parsed = urlparse(raw_url)
+        if parsed.scheme and parsed.netloc:
+            # Browser proxy mode: GET http://host/path HTTP/1.x
+            target_host = parsed.netloc
+            path        = parsed.path or '/'
+            if parsed.query:
+                path += '?' + parsed.query
         else:
-            # HTTP response message for file not found
-                
-            tcpCliSock.send("HTTP/1.0 404 Not Found\r\n".encode())
-            tcpCliSock.send("Content-Type:text/html\r\n\r\n".encode())
-            tcpCliSock.send("<html><body><h1>404 Not Found</h1></body></html>".encode())
-            
-    # Close the client and the server sockets
-    tcpCliSock.close()
+            # URL-hack mode: GET /host/path HTTP/1.x
+            segs = raw_url.lstrip('/').split('/', 1)
+            target_host = segs[0]
+            path        = '/' + segs[1] if len(segs) > 1 else '/'
 
-tcpSerSock.close()
+        print(f"[*] Fetching → {target_host}{path}")
+
+        # 5) Build a safe cache filename
+        clean_path = path.lstrip('/')
+        if clean_path == '':
+            cache_name = target_host
+        else:
+            cache_name = target_host + '_' + clean_path.replace('/', '_')
+        cache_path = os.path.join(cache_dir, cache_name)
+
+        # 6) Serve from cache if available
+        if os.path.exists(cache_path):
+            print('[*] Cache HIT:', cache_path)
+            with open(cache_path, 'rb') as f:
+                client_sock.sendall(f.read())
+            client_sock.close()
+            continue
+
+        # 7) Cache miss → fetch from the real server
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as remote:
+                remote.connect((target_host, 80))
+                # Force the server to close after sending
+                req = (
+                    f"GET {path} HTTP/1.0\r\n"
+                    f"Host: {target_host}\r\n"
+                    "Connection: close\r\n"
+                    "\r\n"
+                ).encode()
+                remote.sendall(req)
+
+                # Read until EOF
+                response = b''
+                while True:
+                    buf = remote.recv(4096)
+                    if not buf:
+                        break
+                    response += buf
+
+        except Exception as e:
+            print('[!] Fetch error:', e)
+            response = (
+                "HTTP/1.0 502 Bad Gateway\r\n"
+                "Content-Type: text/html\r\n\r\n"
+                "<html><body><h1>502 Bad Gateway</h1></body></html>"
+            ).encode()
+
+        # 8) Cache the response
+        try:
+            with open(cache_path, 'wb') as f:
+                f.write(response)
+            print('[*] Cached →', cache_path)
+        except Exception as e:
+            print('[!] Cache write failed:', e)
+
+        # 9) Relay the response back to the client
+        client_sock.sendall(response)
+        client_sock.close()
+
+if __name__ == '__main__':
+    main()
