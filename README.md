@@ -1,8 +1,8 @@
 # Web Proxy Server Lab
-
+- A simple HTTP web server program that handles incoming client requests by parsing HTTP messages, retrieving the requested resources from the server’s file system, constructing proper HTTP response headers, and delivering the requested files or error messages (such as 404 Not Found) back to the client, demonstrating fundamental web server functionality and network communication.
 ----
 
-# AUTHOR INFO
+## Author Info
 
 - Full Names: Ethan E. Lopez, Thomas Johnson, William Meyer, Karam Aboul-Hosn
 - Student IDs: 2425516, 2437165 
